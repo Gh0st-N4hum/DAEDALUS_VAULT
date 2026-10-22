@@ -31,9 +31,9 @@ from pathlib import Path
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
-from PySide6.QtCore import (QEasingCurve, QPoint, QPropertyAnimation, QRectF, Qt,
+from PySide6.QtCore import (QEasingCurve, QPoint, QPointF, QPropertyAnimation, QRectF, Qt,
                             QThread, QTimer, QVariantAnimation, Signal)
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon, QPainter, QPen, QPixmap, QPolygonF, QRadialGradient
 from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QFileDialog, QInputDialog,
                                QFrame, QGraphicsDropShadowEffect, QGridLayout,
                                QHBoxLayout, QLabel, QLineEdit, QMainWindow,
@@ -41,12 +41,17 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QFileDialog, QI
                                QSizePolicy, QStackedWidget, QVBoxLayout, QWidget)
 
 # ───────────────────────────── Design system ─────────────────────────────
-CANVAS, LIMESTONE, TRAVERTINE = "#F7F5F0", "#EBE5DC", "#F2ECE4"
-TAUPE, SLATE, HAIRLINE = "#6E655F", "#9A9088", "#E2DBD1"
-CLAY, MINERAL, ERROR = "#C4A48A", "#A3B1A8", "#B5836A"
-RADIUS = 24
+BG, SURFACE, SURFACE_HI = "#07090D", "#0D1117", "#111B2B"     # logo black, lifted in two steps
+INK, MUTED, LINE = "#F2F5FA", "#7C8798", "#1C2638"            # logo white, secondary, hairline
+ACCENT, OK, ERROR = "#0A6CFF", "#2EE6A8", "#FF5C7A"           # logo ring blue, success, error
+RADIUS = 14
 FONT = "Segoe UI"
 APP_NAME, AUTHOR = "Daedalus Vault", "Jason Bocaling"
+
+
+def spaced(size: int, spacing: float = 3, weight=QFont.DemiBold) -> QFont:
+    """Wide-tracked type, echoing the DAEDALUS wordmark."""
+    f = QFont(FONT, size, weight); f.setLetterSpacing(QFont.AbsoluteSpacing, spacing); return f
 
 
 def resource(rel: str) -> str:
@@ -71,37 +76,41 @@ def logo_label(size: int) -> QLabel:
         pm = pm.scaled(size * 2, size * 2, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         pm.setDevicePixelRatio(2.0)             # crisp on high-DPI screens
         lbl.setPixmap(pm)
+    fx = QGraphicsDropShadowEffect(lbl)          # soft blue halo around the ring
+    fx.setBlurRadius(size * 0.6); fx.setOffset(0, 0); fx.setColor(QColor(10, 108, 255, 150))
+    lbl.setGraphicsEffect(fx)
     return lbl
 
 # state -> (background, border, scale, dashed)
 STATES = {
-    "rest":       (LIMESTONE,  HAIRLINE, 1.00, False),
-    "hover":      (TRAVERTINE, CLAY,     1.01, False),
-    "drag":       (TRAVERTINE, CLAY,     1.02, True),    # organic dashed clay border
-    "processing": (LIMESTONE,  CLAY,     1.00, False),
-    "success":    (LIMESTONE,  MINERAL,  1.00, False),
+    "rest":       (SURFACE,  LINE, 1.00, False),
+    "hover":      (SURFACE_HI, ACCENT,     1.01, False),
+    "drag":       (SURFACE_HI, ACCENT,     1.02, True),    # organic dashed clay border
+    "processing": (SURFACE,  ACCENT,     1.00, False),
+    "success":    (SURFACE,  OK,  1.00, False),
 }
 
 STYLE = f"""
-QMainWindow, QDialog, QScrollArea, QScrollArea > QWidget > QWidget {{ background:{CANVAS}; }}
-QLabel {{ color:{TAUPE}; font-family:'{FONT}'; background:transparent; }}
-QLineEdit {{ background:{LIMESTONE}; border:1px solid {HAIRLINE}; border-radius:14px;
-             padding:10px 14px; color:{TAUPE}; font:11pt '{FONT}'; }}
-QLineEdit:focus {{ border:1px solid {CLAY}; background:{TRAVERTINE}; }}
-QPushButton {{ background:{LIMESTONE}; color:{TAUPE}; border:1px solid {HAIRLINE};
+QMainWindow, QDialog {{ background:{BG}; }}
+QScrollArea, QScrollArea > QWidget, QScrollArea > QWidget > QWidget {{ background:transparent; }}
+QLabel {{ color:{INK}; font-family:'{FONT}'; background:transparent; }}
+QLineEdit {{ background:{SURFACE}; border:1px solid {LINE}; border-radius:14px;
+             padding:10px 14px; color:{INK}; font:11pt '{FONT}'; }}
+QLineEdit:focus {{ border:1px solid {ACCENT}; background:{SURFACE_HI}; }}
+QPushButton {{ background:{SURFACE}; color:{INK}; border:1px solid {LINE};
                border-radius:14px; padding:8px 18px; font:10pt '{FONT}'; }}
-QPushButton:hover {{ background:{TRAVERTINE}; border-color:{CLAY}; }}
-QPushButton#primary {{ background:{CLAY}; color:{CANVAS}; border-color:{CLAY}; }}
-QPushButton#primary:hover {{ background:#B89878; }}
-QCheckBox::indicator {{ width:18px; height:18px; border-radius:6px; border:1px solid {HAIRLINE}; background:{LIMESTONE}; }}
-QCheckBox::indicator:checked {{ background:{CLAY}; border-color:{CLAY}; }}
-QComboBox {{ background:{LIMESTONE}; border:1px solid {HAIRLINE}; border-radius:12px; padding:6px 12px; color:{TAUPE}; }}
-QComboBox QAbstractItemView {{ background:{LIMESTONE}; color:{TAUPE}; selection-background-color:{CLAY}; }}
-QCheckBox {{ color:{SLATE}; font:10pt '{FONT}'; }}
-QFrame#fileCard {{ background:{LIMESTONE}; border:1px solid {HAIRLINE}; border-radius:{RADIUS}px; }}
-QFrame#fileCard:hover {{ background:{TRAVERTINE}; border-color:{CLAY}; }}
+QPushButton:hover {{ background:{SURFACE_HI}; border-color:{ACCENT}; }}
+QPushButton#primary {{ background:{ACCENT}; color:#FFFFFF; border-color:{ACCENT}; }}
+QPushButton#primary:hover {{ background:#2D7FFF; }}
+QCheckBox::indicator {{ width:18px; height:18px; border-radius:6px; border:1px solid {LINE}; background:{SURFACE}; }}
+QCheckBox::indicator:checked {{ background:{ACCENT}; border-color:{ACCENT}; }}
+QComboBox {{ background:{SURFACE}; border:1px solid {LINE}; border-radius:12px; padding:6px 12px; color:{INK}; }}
+QComboBox QAbstractItemView {{ background:{SURFACE}; color:{INK}; selection-background-color:{ACCENT}; }}
+QCheckBox {{ color:{MUTED}; font:10pt '{FONT}'; }}
+QFrame#fileCard {{ background:{SURFACE}; border:1px solid {LINE}; border-radius:{RADIUS}px; }}
+QFrame#fileCard:hover {{ background:{SURFACE_HI}; border-color:{ACCENT}; }}
 QScrollBar:vertical {{ background:transparent; width:10px; }}
-QScrollBar::handle:vertical {{ background:{HAIRLINE}; border-radius:5px; min-height:30px; }}
+QScrollBar::handle:vertical {{ background:{LINE}; border-radius:5px; min-height:30px; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ height:0; }}
 """
 
@@ -297,12 +306,42 @@ class Vault:
                     break
                 chunk, i = nxt, i + 1
 
-    def add_files(self, paths: list[str], folder: str, delete_originals: bool, cb) -> list[dict]:
-        total = max(1, sum(os.path.getsize(p) for p in paths))
-        done, added = 0, []
+    def _ensure_folder(self, path: str) -> None:
+        parts = path.split("/")
+        for i in range(1, len(parts) + 1):
+            f = "/".join(parts[:i])
+            if f not in self.folders:
+                self.folders.append(f)
+
+    def plan(self, paths: list[str], folder: str) -> list[tuple[str, str]]:
+        """Expand dropped files/folders into [(file, vault_folder)], recreating each folder tree inside `folder`."""
+        items: list[tuple[str, str]] = []
         for p in paths:
-            st = os.stat(p)
-            entry = {"id": uuid.uuid4().hex, "folder": folder, "name": os.path.basename(p), "size": st.st_size,
+            if os.path.isdir(p):
+                root = Path(p)
+                base = f"{folder}/{root.name}" if folder else root.name
+                for dirpath, _, files in os.walk(p):
+                    rel = Path(dirpath).relative_to(root).as_posix()
+                    vf = base if rel == "." else f"{base}/{rel}"
+                    self._ensure_folder(vf)                     # empty folders are kept too
+                    items += [(os.path.join(dirpath, f), vf) for f in files]
+            elif os.path.isfile(p):
+                items.append((p, folder))
+        self._save()
+        return items
+
+    def add_files(self, paths: list[str], folder: str, delete_originals: bool, cb) -> list[dict]:
+        """Vault files and whole folders. Unreadable/locked files are skipped (listed in self.skipped)."""
+        self.skipped: list[str] = []
+        items = self.plan(paths, folder)
+        total = max(1, sum(os.path.getsize(p) for p, _ in items))
+        done, added, vaulted = 0, [], []
+        for p, vf in items:
+            try:
+                st = os.stat(p)
+            except OSError:
+                self.skipped.append(p); continue
+            entry = {"id": uuid.uuid4().hex, "folder": vf, "name": os.path.basename(p), "size": st.st_size,
                      "mime": mimetypes.guess_type(p)[0] or "application/octet-stream", "mtime": st.st_mtime}
 
             def on_bytes(n: int) -> None:
@@ -310,15 +349,28 @@ class Vault:
                 done += n
                 cb(done / total)
 
-            self._encrypt_file(p, self.blobs / f"{entry['id']}.vlt", on_bytes)
-            self.entries.append(entry)
-            added.append(entry)
-            self._save()
-            if delete_originals:
+            try:
+                self._encrypt_file(p, self.blobs / f"{entry['id']}.vlt", on_bytes)
+            except OSError:
+                (self.blobs / f"{entry['id']}.vlt").unlink(missing_ok=True)
+                self.skipped.append(p); continue
+            self.entries.append(entry); added.append(entry); vaulted.append(p)
+            if len(added) % 25 == 0:
+                self._save()                                    # batch index writes for big folders
+        self._save()
+        if delete_originals:                                    # only once the index is safely written
+            for p in vaulted:
                 try:
                     os.remove(p)
                 except OSError:
                     pass
+            for p in paths:                                     # then clear out the emptied source folders
+                if os.path.isdir(p):
+                    for dp, _, _ in os.walk(p, topdown=False):
+                        try:
+                            os.rmdir(dp)
+                        except OSError:
+                            pass
         return added
 
     def export(self, entry: dict, dest_dir: str, cb) -> str:
@@ -390,6 +442,19 @@ class Job(QThread):
 
 
 # ───────────────────────────── Tactile card base ─────────────────────────
+class Backdrop(QWidget):
+    """Near-black canvas with a faint dot grid and a soft blue glow from the top."""
+    def paintEvent(self, _) -> None:
+        p = QPainter(self); p.fillRect(self.rect(), QColor(BG))
+        g = QRadialGradient(self.width() / 2, 0, self.width() * 0.6)
+        g.setColorAt(0, QColor(10, 108, 255, 46)); g.setColorAt(1, QColor(10, 108, 255, 0))
+        p.fillRect(self.rect(), g)
+        p.setPen(QPen(QColor(255, 255, 255, 16), 2))
+        for x in range(14, self.width(), 28):
+            for y in range(14, self.height(), 28):
+                p.drawPoint(x, y)
+
+
 def lerp_color(a: QColor, b: QColor, t: float) -> QColor:
     return QColor(*(int(x + (y - x) * t) for x, y in
                     ((a.red(), b.red()), (a.green(), b.green()), (a.blue(), b.blue()))))
@@ -402,7 +467,7 @@ class TactileCard(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self._state = "rest"
-        self._bg, self._bd, self._sc, self._dash = QColor(LIMESTONE), QColor(HAIRLINE), 1.0, False
+        self._bg, self._bd, self._sc, self._dash = QColor(SURFACE), QColor(LINE), 1.0, False
         self._from = self._to = None
         self._anim = QVariantAnimation(self)
         self._anim.setDuration(240)
@@ -435,14 +500,24 @@ class TactileCard(QWidget):
         c = QRectF(self.rect()).center()
         p.translate(c); p.scale(self._sc, self._sc); p.translate(-c)
         p.setPen(Qt.NoPen)
-        for i, a in enumerate((12, 7, 3)):  # soft tonal shadow, no black
-            p.setBrush(QColor(110, 101, 95, a))
-            p.drawRoundedRect(r.adjusted(-i * 3, 2 - i * 2, i * 3, 6 + i * 4), RADIUS + i * 3, RADIUS + i * 3)
+        g = max(0.0, min(1.0, (self._sc - 1.0) / 0.02))        # 0 at rest -> 1 while dragging
+        for i, a in enumerate((14, 9, 5, 2)):                    # soft halo that intensifies on hover / drag
+            p.setBrush(QColor(10, 108, 255, int(a * (0.5 + 2.5 * g))))
+            p.drawRoundedRect(r.adjusted(-i * 4, -i * 4, i * 4, i * 4), RADIUS + i * 4, RADIUS + i * 4)
         pen = QPen(self._bd, 2.0 if self._dash else 1.5, Qt.CustomDashLine if self._dash else Qt.SolidLine)
         if self._dash:
             pen.setDashPattern([5, 4]); pen.setCapStyle(Qt.RoundCap)
         p.setPen(pen); p.setBrush(self._bg)
         p.drawRoundedRect(r, RADIUS, RADIUS)
+        # viewfinder brackets: float outside the card and close in as it "locks on"
+        o, L = 11 - 6 * g, 16
+        col = QColor(OK) if self._state == "success" else QColor(10, 108, 255)
+        col.setAlpha(int(110 + 145 * g))
+        p.setPen(QPen(col, 2, Qt.SolidLine, Qt.SquareCap))
+        for sx, sy, x, y in ((1, 1, r.left(), r.top()), (-1, 1, r.right(), r.top()),
+                             (1, -1, r.left(), r.bottom()), (-1, -1, r.right(), r.bottom())):
+            x, y = x - sx * o, y - sy * o
+            p.drawLine(QPointF(x, y), QPointF(x + sx * L, y)); p.drawLine(QPointF(x, y), QPointF(x, y + sy * L))
         self.paint_content(p, r)
 
     def paint_content(self, p: QPainter, r: QRectF) -> None: ...
@@ -457,16 +532,23 @@ class TactileCard(QWidget):
         return QPen(QColor(color), w, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
 
     def vault_icon(self, p: QPainter, cx: float, cy: float, s: float) -> None:
-        p.setPen(self.pen(TAUPE)); p.setBrush(Qt.NoBrush)
-        p.drawRoundedRect(QRectF(cx - s / 2, cy - s / 2, s, s), s * .22, s * .22)
-        p.drawEllipse(QRectF(cx - s * .22, cy - s * .22, s * .44, s * .44))
-        p.setPen(self.pen(CLAY, 3)); p.drawLine(int(cx), int(cy), int(cx + s * .13), int(cy - s * .13))
-        p.setPen(self.pen(TAUPE)); p.drawLine(int(cx - s * .2), int(cy + s / 2), int(cx - s * .2), int(cy + s / 2 + 7))
-        p.drawLine(int(cx + s * .2), int(cy + s / 2), int(cx + s * .2), int(cy + s / 2 + 7))
+        """Chamfered vault door and dial, with circuit-node lines echoing the Daedalus mark."""
+        cx -= s * 0.13
+        c, x0, y0, x1, y1 = s * 0.2, cx - s / 2, cy - s / 2, cx + s / 2, cy + s / 2
+        door = QPolygonF([QPointF(x0 + c, y0), QPointF(x1, y0), QPointF(x1, y1 - c),
+                          QPointF(x1 - c, y1), QPointF(x0, y1), QPointF(x0, y0 + c)])
+        p.setPen(self.pen(INK, 2.4)); p.setBrush(Qt.NoBrush); p.drawPolygon(door)
+        p.drawEllipse(QRectF(cx - s * .24, cy - s * .24, s * .48, s * .48))
+        p.setPen(self.pen(ACCENT, 3)); p.drawLine(QPointF(cx, cy), QPointF(cx + s * .14, cy - s * .14))
+        p.setBrush(QColor(ACCENT)); p.drawEllipse(QPointF(cx, cy), 3.2, 3.2)
+        p.setPen(self.pen(ACCENT, 2)); p.setBrush(QColor(BG))
+        for dy in (-0.12, 0.12):
+            p.drawLine(QPointF(x1, cy + s * dy), QPointF(x1 + s * .22, cy + s * dy))
+            p.drawEllipse(QPointF(x1 + s * .27, cy + s * dy), 4, 4)
 
     def text(self, p: QPainter, rect: QRectF, txt: str, size: int, color: str, bold=False) -> None:
         p.setPen(QColor(color))
-        p.setFont(QFont(FONT, size, QFont.DemiBold if bold else QFont.Normal))
+        p.setFont(spaced(size, 1.2 if bold else 0.3, QFont.DemiBold if bold else QFont.Normal))
         p.drawText(rect, Qt.AlignCenter, txt)
 
 
@@ -485,8 +567,8 @@ class LockedCard(TactileCard):
     def paint_content(self, p: QPainter, r: QRectF) -> None:
         cx, cy = r.center().x(), r.center().y()
         self.vault_icon(p, cx, cy - 36, 96)
-        self.text(p, QRectF(r.left(), cy + 46, r.width(), 34), "Create your vault" if self.fresh else "Vault is locked", 16, TAUPE, True)
-        self.text(p, QRectF(r.left(), cy + 80, r.width(), 26), "Click the vault to " + ("set a password" if self.fresh else "enter your password"), 10, SLATE)
+        self.text(p, QRectF(r.left(), cy + 46, r.width(), 34), "Create your vault" if self.fresh else "Vault is locked", 16, INK, True)
+        self.text(p, QRectF(r.left(), cy + 80, r.width(), 26), "Click the vault to " + ("set a password" if self.fresh else "enter your password"), 10, MUTED)
 
 
 # ───────────────────────────── Drop zone ─────────────────────────────────
@@ -522,7 +604,7 @@ class DropZone(TactileCard):
 
     def dropEvent(self, e) -> None:
         """onDrop: read file paths, hand to the controller (which starts PROCESSING)."""
-        paths = [u.toLocalFile() for u in e.mimeData().urls() if os.path.isfile(u.toLocalFile())]
+        paths = [u.toLocalFile() for u in e.mimeData().urls() if os.path.exists(u.toLocalFile())]
         e.acceptProposedAction()
         if paths:
             self.filesDropped.emit(paths)
@@ -561,25 +643,27 @@ class DropZone(TactileCard):
     def paint_content(self, p: QPainter, r: QRectF) -> None:
         cx, cy, w = r.center().x(), r.center().y(), r.width()
         if self._state == "processing":
-            self.text(p, QRectF(r.left(), cy - 34, w, 30), "Sealing files…", 14, TAUPE, True)
+            self.text(p, QRectF(r.left(), cy - 34, w, 30), "Sealing files…", 14, INK, True)
             bar = QRectF(cx - 130, cy + 6, 260, 8)
-            p.setPen(Qt.NoPen); p.setBrush(QColor(HAIRLINE)); p.drawRoundedRect(bar, 4, 4)
-            p.setBrush(QColor(CLAY)); p.drawRoundedRect(QRectF(bar.left(), bar.top(), max(8, bar.width() * self._prog), 8), 4, 4)
-            self.text(p, QRectF(r.left(), cy + 22, w, 24), f"{int(self._prog * 100)}%", 10, SLATE)
+            p.setPen(Qt.NoPen); p.setBrush(QColor(LINE)); p.drawRoundedRect(bar, 4, 4)
+            fill = QRectF(bar.left(), bar.top(), max(8, bar.width() * self._prog), 8)
+            p.setBrush(QColor(10, 108, 255, 70)); p.drawRoundedRect(fill.adjusted(-3, -3, 3, 3), 7, 7)
+            p.setBrush(QColor(ACCENT)); p.drawRoundedRect(fill, 4, 4)
+            self.text(p, QRectF(r.left(), cy + 22, w, 24), f"{int(self._prog * 100)}%", 10, MUTED)
         elif self._state == "success":
-            p.setPen(self.pen(MINERAL, 3.4)); p.setBrush(Qt.NoBrush)
+            p.setPen(self.pen(OK, 3.4)); p.setBrush(Qt.NoBrush)
             p.drawEllipse(QRectF(cx - 28, cy - 62, 56, 56))
             p.drawPolyline([QPoint(int(cx - 12), int(cy - 34)), QPoint(int(cx - 3), int(cy - 24)), QPoint(int(cx + 14), int(cy - 44))])
-            self.text(p, QRectF(r.left(), cy + 6, w, 30), "Safely vaulted", 14, TAUPE, True)
+            self.text(p, QRectF(r.left(), cy + 6, w, 30), "Safely vaulted", 14, INK, True)
         else:
             drag = self._state == "drag"
-            p.setPen(self.pen(CLAY if drag else TAUPE, 3)); p.setBrush(Qt.NoBrush)
+            p.setPen(self.pen(ACCENT if drag else INK, 3)); p.setBrush(Qt.NoBrush)
             y = cy - 46 + (6 if drag else 0)
             p.drawLine(int(cx), int(y), int(cx), int(y + 34))
             p.drawPolyline([QPoint(int(cx - 12), int(y + 22)), QPoint(int(cx), int(y + 34)), QPoint(int(cx + 12), int(y + 22))])
             p.drawPolyline([QPoint(int(cx - 22), int(y + 42)), QPoint(int(cx - 22), int(y + 52)), QPoint(int(cx + 22), int(y + 52)), QPoint(int(cx + 22), int(y + 42))])
-            self.text(p, QRectF(r.left(), cy + 18, w, 30), "Release to seal them inside" if drag else "Drop files into the vault", 14, TAUPE, True)
-            self.text(p, QRectF(r.left(), cy + 48, w, 24), "or click to browse", 10, SLATE)
+            self.text(p, QRectF(r.left(), cy + 18, w, 30), "Release to seal them inside" if drag else "Drop files or folders into the vault", 14, INK, True)
+            self.text(p, QRectF(r.left(), cy + 48, w, 24), "or click to browse", 10, MUTED)
 
 
 # ───────────────────────────── File card ─────────────────────────────────
@@ -593,7 +677,7 @@ class FileCard(QFrame):
         self.setObjectName("fileCard")
         self.setFixedWidth(self.CARD_W)
         fx = QGraphicsDropShadowEffect(self)   # soft tonal shadow
-        fx.setBlurRadius(26); fx.setOffset(0, 5); fx.setColor(QColor(110, 101, 95, 38))
+        fx.setBlurRadius(26); fx.setOffset(0, 5); fx.setColor(QColor(10, 108, 255, 36))
         self.setGraphicsEffect(fx)
 
         lay = QVBoxLayout(self); lay.setContentsMargins(22, 18, 22, 16); lay.setSpacing(4)
@@ -602,7 +686,7 @@ class FileCard(QFrame):
         meta = QLabel(f"{human_size(entry['size'])}  ·  {entry['mime']}")
         mod = QLabel("Modified " + time.strftime("%Y-%m-%d %H:%M", time.localtime(entry["mtime"])))
         for w in (meta, mod):
-            w.setStyleSheet(f"color:{SLATE}; font:9pt '{FONT}';")
+            w.setStyleSheet(f"color:{MUTED}; font:9pt '{FONT}';")
         row = QHBoxLayout(); row.setContentsMargins(0, 10, 0, 0)
         op, mv, ex, rm = QPushButton("Open"), QPushButton("Move"), QPushButton("Export"), QPushButton("Delete")
         op.setObjectName("primary")
@@ -627,9 +711,9 @@ class FolderIcon(QWidget):
 
     def paintEvent(self, _) -> None:
         p = QPainter(self); p.setRenderHint(QPainter.Antialiasing)
-        p.setPen(QPen(QColor(TAUPE), 2.2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)); p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor(INK), 2.2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)); p.setBrush(Qt.NoBrush)
         p.drawRoundedRect(QRectF(2, 8, 36, 21), 5, 5)
-        p.setPen(QPen(QColor(CLAY), 2.8, Qt.SolidLine, Qt.RoundCap)); p.drawLine(5, 4, 16, 4)
+        p.setPen(QPen(QColor(ACCENT), 2.8, Qt.SolidLine, Qt.RoundCap)); p.drawLine(5, 4, 16, 4)
 
 
 class FolderCard(QFrame):
@@ -639,13 +723,13 @@ class FolderCard(QFrame):
         super().__init__()
         self.path = path
         self.setObjectName("fileCard"); self.setFixedWidth(FileCard.CARD_W); self.setCursor(Qt.PointingHandCursor)
-        fx = QGraphicsDropShadowEffect(self); fx.setBlurRadius(26); fx.setOffset(0, 5); fx.setColor(QColor(110, 101, 95, 38))
+        fx = QGraphicsDropShadowEffect(self); fx.setBlurRadius(26); fx.setOffset(0, 5); fx.setColor(QColor(10, 108, 255, 36))
         self.setGraphicsEffect(fx)
         lay = QVBoxLayout(self); lay.setContentsMargins(22, 18, 22, 16); lay.setSpacing(4)
         top = QHBoxLayout(); top.addWidget(FolderIcon())
         col = QVBoxLayout(); col.setSpacing(0)
         name = QLabel(path.rpartition("/")[2]); name.setFont(QFont(FONT, 11, QFont.DemiBold))
-        sub = QLabel(f"{count} item{'s' if count != 1 else ''}"); sub.setStyleSheet(f"color:{SLATE}; font:9pt '{FONT}';")
+        sub = QLabel(f"{count} item{'s' if count != 1 else ''}"); sub.setStyleSheet(f"color:{MUTED}; font:9pt '{FONT}';")
         col.addWidget(name); col.addWidget(sub); top.addLayout(col); top.addStretch(); lay.addLayout(top)
         row = QHBoxLayout(); row.setContentsMargins(0, 10, 0, 0)
         for text, sig in (("Rename", self.renameClicked), ("Delete", self.deleteClicked)):
@@ -673,8 +757,8 @@ class VaultView(QWidget):
 
         head = QHBoxLayout()
         col = QVBoxLayout(); col.setSpacing(2)
-        self.title_lbl = t = QLabel("Your Vault"); t.setFont(QFont(FONT, 20, QFont.DemiBold))
-        self.count = QLabel(); self.count.setStyleSheet(f"color:{SLATE}; font:10pt '{FONT}';")
+        self.title_lbl = t = QLabel("Your Vault"); t.setFont(spaced(16, 4))
+        self.count = QLabel(); self.count.setStyleSheet(f"color:{MUTED}; font:10pt '{FONT}';")
         col.addWidget(t); col.addWidget(self.count)
         lock = QPushButton("Lock vault"); lock.setObjectName("primary"); lock.setCursor(Qt.PointingHandCursor)
         lock.clicked.connect(self.lockRequested)
@@ -686,7 +770,7 @@ class VaultView(QWidget):
         nav = QHBoxLayout()
         self.back = QPushButton("←  Back"); self.back.setCursor(Qt.PointingHandCursor)
         self.back.clicked.connect(lambda: self.go(self.cur.rpartition("/")[0]))
-        self.crumb = QLabel(); self.crumb.setStyleSheet(f"color:{SLATE}; font:10pt '{FONT}';")
+        self.crumb = QLabel(); self.crumb.setStyleSheet(f"color:{MUTED}; font:10pt '{FONT}';")
         nav.addWidget(self.back); nav.addWidget(self.crumb); nav.addStretch(); root.addLayout(nav)
 
         self.zone = DropZone()
@@ -694,13 +778,20 @@ class VaultView(QWidget):
         self.zone.clicked.connect(self._browse)
         root.addWidget(self.zone)
         self.delete_orig = QCheckBox("Remove original files after sealing"); self.delete_orig.setChecked(True)
-        root.addWidget(self.delete_orig)
+        opts = QHBoxLayout(); opts.addWidget(self.delete_orig); opts.addStretch()
+        af = QPushButton("Add folder…"); af.setCursor(Qt.PointingHandCursor); af.clicked.connect(self._browse_folder)
+        opts.addWidget(af); root.addLayout(opts)
 
         self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True); self.scroll.setFrameShape(QFrame.NoFrame)
         holder = QWidget(); self.grid = QGridLayout(holder)
         self.grid.setSpacing(16); self.grid.setContentsMargins(4, 4, 4, 16); self.grid.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.scroll.setWidget(holder)
         root.addWidget(self.scroll, 1)
+
+    def _browse_folder(self) -> None:
+        if self.zone.busy: return
+        d = QFileDialog.getExistingDirectory(self, "Choose a folder to vault")
+        if d: self.addRequested.emit([d])
 
     def _browse(self) -> None:
         if self.zone.busy: return
@@ -755,7 +846,7 @@ class PasswordDialog(QDialog):
         lay = QVBoxLayout(self); lay.setContentsMargins(30, 28, 30, 24); lay.setSpacing(12)
         t = QLabel(self.windowTitle()); t.setFont(QFont(FONT, 15, QFont.DemiBold))
         s = QLabel(sub or ("Choose a strong password. Add a backup password later in Settings in case you forget it." if create else "Enter your password or your backup password."))
-        s.setWordWrap(True); s.setStyleSheet(f"color:{SLATE}; font:10pt '{FONT}';")
+        s.setWordWrap(True); s.setStyleSheet(f"color:{MUTED}; font:10pt '{FONT}';")
         self.pw, self.pw2 = QLineEdit(), QLineEdit()
         self.pw.setPlaceholderText("Password"); self.pw2.setPlaceholderText("Confirm password")
         for f in (self.pw, self.pw2):
@@ -801,7 +892,7 @@ class ImageViewer(QDialog):
         self.pix = QPixmap(); self.pix.loadFromData(data)
         self.lbl = QLabel(alignment=Qt.AlignCenter)
         self.lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
-        self.lbl.setStyleSheet(f"background:{LIMESTONE}; border:1px solid {HAIRLINE}; border-radius:{RADIUS}px;")
+        self.lbl.setStyleSheet(f"background:{SURFACE}; border:1px solid {LINE}; border-radius:{RADIUS}px;")
         lay = QVBoxLayout(self); lay.setContentsMargins(18, 18, 18, 18); lay.addWidget(self.lbl)
 
     def valid(self) -> bool:
@@ -827,17 +918,17 @@ class MainWindow(QMainWindow):
         self.vault.wipe_tmp()          # remove any decrypted leftovers from a crashed session
         self.opened: dict[str, dict] = {}   # entry id -> {entry, path, stamp, wiped}
         self.stack = QStackedWidget()
-        shell = QWidget(); sl = QVBoxLayout(shell); sl.setContentsMargins(0, 0, 0, 0); sl.setSpacing(0)
+        shell = Backdrop(); sl = QVBoxLayout(shell); sl.setContentsMargins(0, 0, 0, 0); sl.setSpacing(0)
         sl.addWidget(self.stack, 1)
         footer = QLabel(f"Created by {AUTHOR}"); footer.setAlignment(Qt.AlignCenter)   # very bottom of the app
-        footer.setStyleSheet(f"color:{SLATE}; font:9pt '{FONT}'; padding:10px 0 14px 0;")
+        footer.setStyleSheet(f"color:{MUTED}; font:9pt '{FONT}'; padding:10px 0 14px 0;")
         sl.addWidget(footer)
         self.setCentralWidget(shell)
 
         self.locked_page = QWidget(); lp = QVBoxLayout(self.locked_page)
         lp.setContentsMargins(40, 24, 40, 12); lp.setAlignment(Qt.AlignCenter); lp.setSpacing(10)
         lp.addWidget(logo_label(104), 0, Qt.AlignCenter)
-        self.brand = brand = QLabel(self.vault.title()); brand.setFont(QFont(FONT, 18, QFont.DemiBold)); brand.setAlignment(Qt.AlignCenter)
+        self.brand = brand = QLabel(self.vault.title()); brand.setFont(spaced(18, 6)); brand.setAlignment(Qt.AlignCenter)
         lp.addWidget(brand)
         self.locked_card = LockedCard(not self.vault.exists())
         self.locked_card.clicked.connect(self.open_vault)
@@ -881,7 +972,7 @@ class MainWindow(QMainWindow):
         delete, folder = self.view.delete_orig.isChecked(), self.view.cur       # files land in the folder you're viewing
         self._job = Job(lambda cb: self.vault.add_files(paths, folder, delete, cb))
         self._job.progress.connect(zone.set_progress)
-        self._job.ok.connect(lambda _: zone.flash_success(lambda: self._refresh()))  # success flash, then update grid
+        self._job.ok.connect(lambda _: zone.flash_success(self._after_add))  # success flash, then update grid
         self._job.fail.connect(lambda m: (zone.reset(), QMessageBox.warning(self, "Vault", m)))
         self._job.start()
 
@@ -891,7 +982,15 @@ class MainWindow(QMainWindow):
 
     def _apply_title(self) -> None:
         t = self.vault.title()
-        self.setWindowTitle(t); self.brand.setText(t); self.view.title_lbl.setText(t)
+        self.setWindowTitle(t); self.brand.setText(t.upper()); self.view.title_lbl.setText(t.upper())
+
+    def _after_add(self) -> None:
+        self._refresh()
+        n = len(getattr(self.vault, "skipped", []))
+        if n:
+            names = "\n• ".join(os.path.basename(x) for x in self.vault.skipped[:8]) + ("\n• …" if n > 8 else "")
+            QMessageBox.warning(self, "Some files were skipped",
+                                f"{n} file{'s' if n != 1 else ''} couldn't be read (in use or no permission) and were left where they are:\n\n• {names}")
 
     def _attempt(self, fn, *args) -> bool:
         try:
@@ -929,7 +1028,7 @@ class MainWindow(QMainWindow):
         lay = QVBoxLayout(d); lay.setContentsMargins(30, 26, 30, 24); lay.setSpacing(10)
 
         def note(text: str) -> QLabel:
-            l = QLabel(text); l.setWordWrap(True); l.setStyleSheet(f"color:{SLATE}; font:9pt '{FONT}';"); return l
+            l = QLabel(text); l.setWordWrap(True); l.setStyleSheet(f"color:{MUTED}; font:9pt '{FONT}';"); return l
 
         h = QLabel("Settings"); h.setFont(QFont(FONT, 15, QFont.DemiBold)); lay.addWidget(h)
         lay.addWidget(note("Vault name (shown on the lock screen and title bar)"))
