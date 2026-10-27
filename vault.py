@@ -33,7 +33,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from PySide6.QtCore import (QEasingCurve, QPoint, QPointF, QPropertyAnimation, QRectF, Qt,
                             QThread, QTimer, QVariantAnimation, Signal)
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon, QPainter, QPen, QPixmap, QPolygonF, QRadialGradient
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon, QImage, QPainter, QPainterPath, QPen, QPixmap, QPolygonF, QRadialGradient
 from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QFileDialog, QInputDialog,
                                QFrame, QGraphicsDropShadowEffect, QGridLayout,
                                QHBoxLayout, QLabel, QLineEdit, QMainWindow,
@@ -45,6 +45,7 @@ BG, SURFACE, SURFACE_HI = "#07090D", "#0D1117", "#111B2B"     # logo black, lift
 INK, MUTED, LINE = "#F2F5FA", "#7C8798", "#1C2638"            # logo white, secondary, hairline
 ACCENT, OK, ERROR = "#0A6CFF", "#2EE6A8", "#FF5C7A"           # logo ring blue, success, error
 RADIUS = 14
+PALETTE = ["#0A6CFF", "#22D3EE", "#2EE6A8", "#8B5CF6", "#F43F8E", "#FFB020"]   # profile colours
 FONT = "Segoe UI"
 APP_NAME, AUTHOR = "Daedalus Vault", "Jason Bocaling"
 
@@ -131,12 +132,9 @@ unb64 = lambda s: base64.b64decode(s)
 class Vault:
     CH = 4 * 1024 * 1024
 
-    def __init__(self) -> None:
-        base = Path(os.environ.get("APPDATA", Path.home()))
-        self.root = base / "DaedalusVault"
-        old = base / "LimewashVault"            # migrate a vault created before the rename
-        if old.exists() and not self.root.exists():
-            old.rename(self.root)
+    def __init__(self, root: Path) -> None:
+        self.root = root                    # one folder per user
+        self.root.mkdir(parents=True, exist_ok=True)
         self.blobs, self.meta = self.root / "blobs", self.root / "vault.meta"
         self.index_path = self.root / "index.vlt"
         self.tmp = self.root / "open"
@@ -426,6 +424,61 @@ class Vault:
         self._save()
 
 
+class UserStore:
+    """Plain-text list of profiles (name, avatar, colour). Each user's files live in users/<id>/ under their own password."""
+    def __init__(self) -> None:
+        base = Path(os.environ.get("APPDATA", Path.home()))
+        old = base / "LimewashVault"
+        self.root = base / "DaedalusVault"
+        if old.exists() and not self.root.exists():
+            old.rename(self.root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.file = self.root / "users.json"
+        self.users: list[dict] = json.loads(self.file.read_text()) if self.file.exists() else []
+        if not self.users and (self.root / "vault.meta").exists():       # adopt the single-user vault from older versions
+            u = self.add("Me")
+            for n in ("vault.meta", "index.vlt", "blobs"):
+                if (self.root / n).exists():
+                    shutil.move(str(self.root / n), str(self.dir(u["id"]) / n))
+            shutil.rmtree(self.root / "open", ignore_errors=True)
+
+    def dir(self, uid: str) -> Path:
+        return self.root / "users" / uid
+
+    def save(self) -> None:
+        self.file.write_text(json.dumps(self.users))
+
+    def add(self, name: str) -> dict:
+        u = {"id": uuid.uuid4().hex[:10], "name": name, "color": PALETTE[len(self.users) % len(PALETTE)], "avatar": ""}
+        self.users.append(u); self.dir(u["id"]).mkdir(parents=True, exist_ok=True); self.save()
+        return u
+
+    def update(self, u: dict, **kw) -> None:
+        u.update(kw); self.save()
+
+    def remove(self, u: dict) -> None:
+        shutil.rmtree(self.dir(u["id"]), ignore_errors=True); self.users.remove(u); self.save()
+
+    def avatar_path(self, u: dict):
+        if not u.get("avatar"): return None
+        p = self.dir(u["id"]) / u["avatar"]
+        return p if p.exists() else None
+
+    def set_avatar(self, u: dict, src: str) -> None:
+        img = QImage(src)
+        if img.isNull(): raise ValueError("Couldn't read that image.")
+        side = min(img.width(), img.height())          # centre-crop to a square, then shrink
+        img = img.copy((img.width() - side) // 2, (img.height() - side) // 2, side, side).scaled(256, 256, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        img.save(str(self.dir(u["id"]) / "avatar.png"), "PNG")
+        self.update(u, avatar="avatar.png")
+
+    def clear_avatar(self, u: dict) -> None:
+        (self.dir(u["id"]) / "avatar.png").unlink(missing_ok=True); self.update(u, avatar="")
+
+    def wipe_all_tmp(self) -> None:
+        for u in self.users: shutil.rmtree(self.dir(u["id"]) / "open", ignore_errors=True)
+
+
 class Job(QThread):
     """Runs a Vault operation off the UI thread so animations stay smooth."""
     progress, ok, fail = Signal(float), Signal(object), Signal(str)
@@ -559,7 +612,7 @@ class LockedCard(TactileCard):
         super().__init__()
         self.fresh = fresh
         self.setCursor(Qt.PointingHandCursor)
-        self.setMinimumSize(420, 330)
+        self.setMinimumSize(420, 310)
 
     def enterEvent(self, _) -> None: self.set_state("hover")
     def leaveEvent(self, _) -> None: self.set_state("rest")
@@ -765,6 +818,7 @@ class VaultView(QWidget):
         head.addWidget(logo_label(52)); head.addSpacing(6); head.addLayout(col); head.addStretch()
         nf, st = QPushButton("New folder"), QPushButton("Settings")
         nf.clicked.connect(self.newFolderRequested); st.clicked.connect(self.settingsRequested)
+        self.avatar = Avatar(40); head.addSpacing(4); head.addWidget(self.avatar); head.addSpacing(6)
         for b in (nf, st, lock): b.setCursor(Qt.PointingHandCursor); head.addWidget(b)
         root.addLayout(head)
         nav = QHBoxLayout()
@@ -884,6 +938,69 @@ class PasswordDialog(QDialog):
 
 
 # ───────────────────────────── Main window ───────────────────────────────
+class Avatar(QWidget):
+    """Round avatar with a ring in the user's colour; falls back to initials."""
+    def __init__(self, size: int) -> None:
+        super().__init__(); self.setFixedSize(size, size); self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.pm, self.name, self.color = None, "?", ACCENT
+
+    def set_user(self, user: dict, store: UserStore) -> None:
+        self.name, self.color = user["name"], user.get("color", ACCENT)
+        path = store.avatar_path(user)
+        pm = QPixmap(str(path)) if path else None
+        self.pm = pm if pm is not None and not pm.isNull() else None
+        self.update()
+
+    def paintEvent(self, _) -> None:
+        p = QPainter(self); p.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform)
+        r = QRectF(self.rect()).adjusted(4, 4, -4, -4)
+        if self.pm:
+            clip = QPainterPath(); clip.addEllipse(r); p.setClipPath(clip); p.drawPixmap(r.toRect(), self.pm); p.setClipping(False)
+        else:
+            p.setPen(Qt.NoPen); p.setBrush(QColor(SURFACE_HI)); p.drawEllipse(r)
+            p.setPen(QColor(INK)); p.setFont(spaced(max(8, int(self.width() * 0.3)), 0))
+            p.drawText(r, Qt.AlignCenter, "".join(w[0] for w in self.name.split()[:2]).upper() or "?")
+        p.setPen(QPen(QColor(self.color), 2.5)); p.setBrush(Qt.NoBrush); p.drawEllipse(r.adjusted(-2, -2, 2, 2))
+
+
+class UserCard(TactileCard):
+    def __init__(self, user: dict, store: UserStore, label: str | None = None) -> None:
+        super().__init__()
+        self.setCursor(Qt.PointingHandCursor); self.setFixedSize(190, 210)
+        lay = QVBoxLayout(self); lay.setContentsMargins(24, 30, 24, 24); lay.setSpacing(10)
+        av = Avatar(92); av.set_user(user, store); lay.addWidget(av, 0, Qt.AlignCenter)
+        n = QLabel(label or user["name"]); n.setFont(spaced(11, 1)); n.setAlignment(Qt.AlignCenter)
+        n.setAttribute(Qt.WA_TransparentForMouseEvents); lay.addWidget(n)
+
+    def enterEvent(self, _) -> None: self.set_state("hover")
+    def leaveEvent(self, _) -> None: self.set_state("rest")
+
+
+class UserPicker(QWidget):
+    chosen, addRequested = Signal(dict), Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        lay = QVBoxLayout(self); lay.setContentsMargins(40, 28, 40, 12); lay.setSpacing(10)
+        lay.addWidget(logo_label(84), 0, Qt.AlignCenter)
+        t = QLabel("WHO’S ENTERING?"); t.setFont(spaced(16, 5)); t.setAlignment(Qt.AlignCenter); lay.addWidget(t)
+        s = QLabel("Every user has their own private vault and password"); s.setAlignment(Qt.AlignCenter)
+        s.setStyleSheet(f"color:{MUTED}; font:10pt '{FONT}';"); lay.addWidget(s)
+        sc = QScrollArea(); sc.setWidgetResizable(True); sc.setFrameShape(QFrame.NoFrame)
+        holder = QWidget(); self.grid = QGridLayout(holder); self.grid.setSpacing(22); self.grid.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
+        sc.setWidget(holder); lay.addWidget(sc, 1)
+
+    def refresh(self, store: UserStore) -> None:
+        while self.grid.count():
+            w = self.grid.takeAt(0).widget()
+            if w: w.setParent(None); w.deleteLater()
+        cards = []
+        for u in store.users:
+            c = UserCard(u, store); c.clicked.connect(lambda u=u: self.chosen.emit(u)); cards.append(c)
+        add = UserCard({"name": "+", "color": MUTED}, store, "Add user"); add.clicked.connect(self.addRequested); cards.append(add)
+        for i, c in enumerate(cards): self.grid.addWidget(c, i // 3, i % 3)
+
+
 class ImageViewer(QDialog):
     """Built-in viewer: the image is decoded from memory, never written to disk."""
     def __init__(self, parent, name: str, data: bytes) -> None:
@@ -913,9 +1030,10 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowIcon(QIcon(logo_pixmap()))
-        self.resize(980, 800); self.setMinimumSize(680, 640)
-        self.vault, self._job = Vault(), None
-        self.vault.wipe_tmp()          # remove any decrypted leftovers from a crashed session
+        self.resize(980, 800); self.setMinimumSize(820, 640)
+        self.store, self._job = UserStore(), None
+        self.vault, self.user = None, None          # chosen on the profile screen
+        self.store.wipe_all_tmp()          # remove any decrypted leftovers from a crashed session
         self.opened: dict[str, dict] = {}   # entry id -> {entry, path, stamp, wiped}
         self.stack = QStackedWidget()
         shell = Backdrop(); sl = QVBoxLayout(shell); sl.setContentsMargins(0, 0, 0, 0); sl.setSpacing(0)
@@ -927,10 +1045,15 @@ class MainWindow(QMainWindow):
 
         self.locked_page = QWidget(); lp = QVBoxLayout(self.locked_page)
         lp.setContentsMargins(40, 24, 40, 12); lp.setAlignment(Qt.AlignCenter); lp.setSpacing(10)
-        lp.addWidget(logo_label(104), 0, Qt.AlignCenter)
-        self.brand = brand = QLabel(self.vault.title()); brand.setFont(spaced(18, 6)); brand.setAlignment(Qt.AlignCenter)
+        lp.addWidget(logo_label(84), 0, Qt.AlignCenter)
+        self.brand = brand = QLabel(""); brand.setFont(spaced(18, 6)); brand.setAlignment(Qt.AlignCenter)
         lp.addWidget(brand)
-        self.locked_card = LockedCard(not self.vault.exists())
+        chip = QHBoxLayout(); chip.setSpacing(10); chip.addStretch()
+        self.chip_av = Avatar(36); self.chip_name = QLabel(); self.chip_name.setFont(spaced(10, 1))
+        sw = QPushButton("Switch user"); sw.setCursor(Qt.PointingHandCursor); sw.clicked.connect(lambda: self._show_picker())
+        for w in (self.chip_av, self.chip_name, sw): chip.addWidget(w)
+        chip.addStretch(); lp.addLayout(chip)
+        self.locked_card = LockedCard(True)
         self.locked_card.clicked.connect(self.open_vault)
         lp.addWidget(self.locked_card, 0, Qt.AlignCenter)
 
@@ -945,12 +1068,14 @@ class MainWindow(QMainWindow):
         self.view.settingsRequested.connect(self.open_settings)
         self.view.exportRequested.connect(self.export_file)
         self.view.deleteRequested.connect(self.delete_file)
-        self.stack.addWidget(self.locked_page); self.stack.addWidget(self.view)
-        self._apply_title()
+        self.picker = UserPicker()
+        self.picker.chosen.connect(self.select_user); self.picker.addRequested.connect(self.add_user)
+        self.stack.addWidget(self.locked_page); self.stack.addWidget(self.view); self.stack.addWidget(self.picker)
+        self._show_picker()
 
     def open_vault(self) -> None:
         fresh = not self.vault.exists()
-        submit = (lambda pw: self.vault.create(pw)) if fresh else \
+        submit = (lambda pw: self.vault.create(pw, f"{self.user['name']}'s Vault")) if fresh else \
                  (lambda pw: None if self.vault.unlock(pw) else "Incorrect password.")
         if PasswordDialog(self, fresh, submit).exec() == QDialog.Accepted:
             self._refresh(); self.stack.setCurrentIndex(1)
@@ -981,8 +1106,32 @@ class MainWindow(QMainWindow):
         self.view.refresh(self.vault.entries, self.vault.folders)
 
     def _apply_title(self) -> None:
-        t = self.vault.title()
+        t = self.vault.title() if self.vault.exists() else f"{self.user['name']}'s Vault"
         self.setWindowTitle(t); self.brand.setText(t.upper()); self.view.title_lbl.setText(t.upper())
+
+    # ---- users ----------------------------------------------------------
+    def _show_picker(self) -> None:
+        self.setWindowTitle(APP_NAME); self.picker.refresh(self.store); self.stack.setCurrentIndex(2)
+
+    def select_user(self, user: dict) -> None:
+        self.user, self.vault = user, Vault(self.store.dir(user["id"]))     # each user has a separate vault folder
+        self.locked_card.fresh = not self.vault.exists(); self.locked_card.update()
+        self._apply_user(); self._apply_title(); self.stack.setCurrentIndex(0)
+
+    def add_user(self) -> None:
+        name, ok = QInputDialog.getText(self, "New user", "Name for the new user:")
+        if ok and name.strip(): self.select_user(self.store.add(name.strip()))
+
+    def _apply_user(self) -> None:
+        for av in (self.view.avatar, self.chip_av): av.set_user(self.user, self.store)
+        self.chip_name.setText(self.user["name"])
+
+    def _delete_user(self, dlg: QDialog) -> None:
+        if QMessageBox.question(self, "Delete user", f"Permanently delete “{self.user['name']}” and every file in their vault?\nThis cannot be undone.") != QMessageBox.Yes:
+            return
+        dlg.accept(); self.vault.wipe_tmp(); self.opened.clear(); self.vault.lock()
+        self.store.remove(self.user); self.vault = self.user = None
+        self.view.refresh([], []); self._show_picker()
 
     def _after_add(self) -> None:
         self._refresh()
@@ -1031,6 +1180,30 @@ class MainWindow(QMainWindow):
             l = QLabel(text); l.setWordWrap(True); l.setStyleSheet(f"color:{MUTED}; font:9pt '{FONT}';"); return l
 
         h = QLabel("Settings"); h.setFont(QFont(FONT, 15, QFont.DemiBold)); lay.addWidget(h)
+        lay.addWidget(note("Profile"))
+        prof = QHBoxLayout(); av = Avatar(72); av.set_user(self.user, self.store); prof.addWidget(av)
+        col = QVBoxLayout(); uname = QLineEdit(self.user["name"]); col.addWidget(uname)
+        row = QHBoxLayout(); up, rm = QPushButton("Upload avatar…"), QPushButton("Remove"); row.addWidget(up); row.addWidget(rm)
+        col.addLayout(row); prof.addLayout(col); lay.addLayout(prof)
+
+        def refresh_profile() -> None:
+            av.set_user(self.user, self.store); self._apply_user()
+
+        def rename() -> None:
+            if uname.text().strip(): self.store.update(self.user, name=uname.text().strip()); refresh_profile()
+
+        def pick() -> None:
+            f, _ = QFileDialog.getOpenFileName(d, "Choose an avatar", "", "Images (*.png *.jpg *.jpeg *.bmp *.webp *.gif)")
+            if f and self._attempt(self.store.set_avatar, self.user, f): refresh_profile()
+
+        uname.editingFinished.connect(rename); up.clicked.connect(pick)
+        rm.clicked.connect(lambda: (self.store.clear_avatar(self.user), refresh_profile()))
+        sw = QHBoxLayout()                                           # profile colour (avatar ring)
+        for c in PALETTE:
+            b = QPushButton(); b.setFixedSize(26, 26); b.setCursor(Qt.PointingHandCursor)
+            b.setStyleSheet(f"background:{c}; border:2px solid {LINE}; border-radius:13px; padding:0;")
+            b.clicked.connect(lambda _=False, c=c: (self.store.update(self.user, color=c), refresh_profile())); sw.addWidget(b)
+        sw.addStretch(); lay.addLayout(sw); lay.addSpacing(8)
         lay.addWidget(note("Vault name (shown on the lock screen and title bar)"))
         name = QLineEdit(self.vault.title()); lay.addWidget(name)
         b = QPushButton("Save name"); lay.addWidget(b)
@@ -1047,6 +1220,9 @@ class MainWindow(QMainWindow):
         if has:
             r = QPushButton("Remove backup password"); lay.addWidget(r)
             r.clicked.connect(lambda: (self.vault.remove_backup(), d.accept()))
+        lay.addSpacing(10)
+        dz = QPushButton("Delete this user and their vault…"); dz.setStyleSheet(f"color:{ERROR};"); lay.addWidget(dz)
+        dz.clicked.connect(lambda: self._delete_user(d))
         d.exec()
 
     def open_file(self, entry: dict) -> None:
@@ -1132,7 +1308,8 @@ class MainWindow(QMainWindow):
         if stuck and QMessageBox.question(self, "Quit", "These files are still open:\n• " + "\n• ".join(stuck) +
                 "\n\nQuit anyway? Unsaved edits are lost; temporary copies are wiped on next launch.") != QMessageBox.Yes:
             e.ignore(); return
-        self.vault.lock(); super().closeEvent(e)
+        if self.vault: self.vault.lock()
+        super().closeEvent(e)
 
 
 if __name__ == "__main__":
