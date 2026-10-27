@@ -22,19 +22,21 @@ import base64
 import json
 import mimetypes
 import os
+import re
 import shutil
 import sys
 import time
+import zipfile
 import uuid
 from pathlib import Path
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
-from PySide6.QtCore import (QEasingCurve, QPoint, QPointF, QPropertyAnimation, QRectF, Qt,
+from PySide6.QtCore import (QEasingCurve, QEvent, QPoint, QPointF, QPropertyAnimation, QRectF, Qt,
                             QThread, QTimer, QVariantAnimation, Signal)
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QIcon, QImage, QPainter, QPainterPath, QPen, QPixmap, QPolygonF, QRadialGradient
-from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QFileDialog, QInputDialog,
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QInputDialog,
                                QFrame, QGraphicsDropShadowEffect, QGridLayout,
                                QHBoxLayout, QLabel, QLineEdit, QMainWindow,
                                QMessageBox, QPushButton, QScrollArea,
@@ -45,6 +47,7 @@ BG, SURFACE, SURFACE_HI = "#07090D", "#0D1117", "#111B2B"     # logo black, lift
 INK, MUTED, LINE = "#F2F5FA", "#7C8798", "#1C2638"            # logo white, secondary, hairline
 ACCENT, OK, ERROR = "#0A6CFF", "#2EE6A8", "#FF5C7A"           # logo ring blue, success, error
 RADIUS = 14
+LEGACY_N, KDF_N = 2**15, 2**16        # scrypt cost: old slots / new slots (the cost is stored in each password slot)
 PALETTE = ["#0A6CFF", "#22D3EE", "#2EE6A8", "#8B5CF6", "#F43F8E", "#FFB020"]   # profile colours
 FONT = "Segoe UI"
 APP_NAME, AUTHOR = "Daedalus Vault", "Jason Bocaling"
@@ -147,8 +150,8 @@ class Vault:
         return self.meta.exists()
 
     @staticmethod
-    def _derive(pw: str, salt: bytes) -> bytes:
-        return Scrypt(salt=salt, length=32, n=2**15, r=8, p=1).derive(pw.encode())
+    def _derive(pw: str, salt: bytes, n: int = LEGACY_N) -> bytes:
+        return Scrypt(salt=salt, length=32, n=n, r=8, p=1).derive(pw.encode())
 
     @staticmethod
     def _seal(key: bytes, data: bytes) -> bytes:
@@ -161,21 +164,28 @@ class Vault:
 
     # --- keys: a random master key, wrapped separately by the password and the backup password
     def _meta(self) -> dict:
-        return json.loads(self.meta.read_text())
+        try:
+            return json.loads(self.meta.read_text())
+        except (OSError, ValueError):                       # damaged: fall back to the last good copy
+            return json.loads(self.meta.with_suffix(".bak").read_text())
 
     def _write_meta(self, m: dict) -> None:
-        self.meta.write_text(json.dumps(m))
+        tmp = self.meta.with_suffix(".tmp")
+        tmp.write_text(json.dumps(m))
+        if self.meta.exists():
+            shutil.copy2(self.meta, self.meta.with_suffix(".bak"))
+        os.replace(tmp, self.meta)                          # atomic: never a half-written file
 
     def _wrap(self, pw: str) -> dict:
         salt = os.urandom(16)
-        return {"salt": b64(salt), "wrap": b64(self._seal(self._derive(pw, salt), self.key))}
+        return {"salt": b64(salt), "n": KDF_N, "wrap": b64(self._seal(self._derive(pw, salt, KDF_N), self.key))}
 
     @staticmethod
     def _try(pw: str, slot: dict | None):
         if not slot:
             return None
         try:
-            return Vault._open(Vault._derive(pw, unb64(slot["salt"])), unb64(slot["wrap"]))
+            return Vault._open(Vault._derive(pw, unb64(slot["salt"]), slot.get("n", LEGACY_N)), unb64(slot["wrap"]))
         except InvalidTag:
             return None
 
@@ -196,8 +206,11 @@ class Vault:
 
     def unlock(self, pw: str) -> bool:
         m = self._meta()
+        hit = key = None
         if "main" in m:
-            key = self._try(pw, m["main"]) or self._try(pw, m.get("backup"))   # password OR backup password
+            for name in ("main", "backup"):
+                key = self._try(pw, m.get(name))
+                if key: hit = name; break   # password OR backup password
         else:                                   # legacy vault: key was derived straight from the password
             try:
                 key = self._derive(pw, unb64(m["salt"])); self._open(key, unb64(m["check"]))
@@ -205,13 +218,16 @@ class Vault:
                 key = None
         if key is None:
             return False
+        raw = self._load_index(key)
         self.key = key
-        raw = json.loads(self._open(key, self.index_path.read_bytes())) if self.index_path.exists() else {}
         if isinstance(raw, list):
             raw = {"entries": raw}
         self.entries, self.folders = raw.get("entries", []), raw.get("folders", [])
         if "main" not in m:                     # upgrade legacy vault in place (files stay readable)
+            shutil.copy2(self.meta, self.meta.with_suffix(".legacy"))        # keep the pre-upgrade meta file
             self._write_meta({"v": 2, "title": m.get("title", APP_NAME), "main": self._wrap(pw)})
+        elif hit and m[hit].get("n", LEGACY_N) < KDF_N:                       # re-wrap at the current scrypt cost
+            m[hit] = self._wrap(pw); self._write_meta(m)
         return True
 
     def lock(self) -> None:
@@ -220,6 +236,8 @@ class Vault:
     def _save(self) -> None:
         tmp = self.index_path.with_suffix(".tmp")
         tmp.write_bytes(self._seal(self.key, json.dumps({"entries": self.entries, "folders": self.folders}).encode()))
+        if self.index_path.exists():
+            shutil.copy2(self.index_path, self.index_path.with_suffix(".bak"))   # rolling copy of the last good index
         os.replace(tmp, self.index_path)
 
     def change_password(self, pw: str) -> None:
@@ -239,6 +257,25 @@ class Vault:
 
     def remove_backup(self) -> None:
         m = self._meta(); m.pop("backup", None); self._write_meta(m)
+
+    def _load_index(self, key: bytes) -> dict:
+        existing = [q for q in (self.index_path, self.index_path.with_suffix(".bak")) if q.exists()]
+        for q in existing:
+            try:
+                return json.loads(self._open(key, q.read_bytes()))
+            except (ValueError, InvalidTag):
+                continue
+        if existing:                                        # never silently start empty: that would orphan every file
+            raise ValueError("The vault index is damaged and no readable backup copy exists.")
+        return {}
+
+    def backup(self, dest: str, cb) -> str:
+        """Zip the already-encrypted vault files. Safe to store anywhere; useless without a password."""
+        files = [self.meta, self.index_path] + sorted(self.blobs.glob("*.vlt"))
+        with zipfile.ZipFile(dest, "w", zipfile.ZIP_STORED) as z:
+            for i, f in enumerate(files):
+                z.write(f, f.relative_to(self.root).as_posix()); cb((i + 1) / len(files))
+        return dest
 
     # --- folders
     @staticmethod
@@ -273,36 +310,75 @@ class Vault:
         entry["folder"] = folder; self._save()
 
     # --- file operations (run inside a worker thread)
-    def _encrypt_file(self, src_path: str, blob: Path, on_bytes) -> None:
-        aes = AESGCM(self.key)
-        with open(src_path, "rb") as src, open(blob, "wb") as dst:
+    @staticmethod
+    def _aad(entry: dict, last: bool) -> bytes:
+        """fmt 2 binds every chunk to its entry id (a swapped blob fails authentication); legacy blobs used only the flag."""
+        return (entry["id"].encode() if entry.get("fmt") == 2 else b"") + (b"\x01" if last else b"\x00")
+
+    def _file_chunks(self, path: str):
+        with open(path, "rb") as f:
+            while chunk := f.read(self.CH):
+                yield chunk
+
+    def _write_blob(self, chunks, entry: dict, blob: Path, on_bytes) -> None:
+        """Encrypt an iterable of plaintext chunks into `blob` in the fmt-2 layout."""
+        aes, new_fmt = AESGCM(self.key), {"id": entry["id"], "fmt": 2}
+        with open(blob, "wb") as dst:
             base, i = os.urandom(8), 0
             dst.write(base)
-            chunk = src.read(self.CH)
+            it = iter(chunks); cur = next(it, b"")
             while True:
-                nxt = src.read(self.CH)
-                last = not nxt
-                dst.write(aes.encrypt(base + i.to_bytes(4, "big"), chunk, b"\x01" if last else b"\x00"))
-                on_bytes(len(chunk))
+                nxt = next(it, None); last = nxt is None
+                dst.write(aes.encrypt(base + i.to_bytes(4, "big"), cur, self._aad(new_fmt, last)))
+                on_bytes(len(cur))
                 if last:
                     break
-                chunk, i = nxt, i + 1
+                cur, i = nxt, i + 1
 
-    def _decrypt_stream(self, entry: dict, write, cb) -> None:
+    def _open_chunks(self, entry: dict):
+        """Yield authenticated plaintext chunks (raises InvalidTag on any tampering, truncation or swap)."""
         aes = AESGCM(self.key)
         with open(self.blobs / f"{entry['id']}.vlt", "rb") as src:
-            base, i, done = src.read(8), 0, 0
-            chunk = src.read(self.CH + 16)
+            base, i = src.read(8), 0
+            cur = src.read(self.CH + 16)
             while True:
-                nxt = src.read(self.CH + 16)
-                last = not nxt
-                data = aes.decrypt(base + i.to_bytes(4, "big"), chunk, b"\x01" if last else b"\x00")
-                write(data)
-                done += len(data)
-                cb(done / max(1, entry["size"]))
+                nxt = src.read(self.CH + 16); last = not nxt
+                yield aes.decrypt(base + i.to_bytes(4, "big"), cur, self._aad(entry, last))
                 if last:
                     break
-                chunk, i = nxt, i + 1
+                cur, i = nxt, i + 1
+
+    def _decrypt_stream(self, entry: dict, write, cb) -> None:
+        done = 0
+        for data in self._open_chunks(entry):
+            write(data); done += len(data); cb(done / max(1, entry["size"]))
+
+    def verify(self, cb) -> dict:
+        """Authenticate every file without writing plaintext anywhere; report damaged, missing and unreferenced blobs."""
+        res = {"checked": 0, "damaged": [], "missing": [], "orphans": []}
+        for i, e in enumerate(self.entries):
+            if not (self.blobs / f"{e['id']}.vlt").exists():
+                res["missing"].append(e["name"])
+            else:
+                try:
+                    if sum(len(c) for c in self._open_chunks(e)) != e["size"]:
+                        res["damaged"].append(e["name"])
+                except (InvalidTag, OSError, ValueError):
+                    res["damaged"].append(e["name"])
+            res["checked"] += 1; cb((i + 1) / max(1, len(self.entries)))
+        known = {e["id"] for e in self.entries}
+        res["orphans"] = [f.name for f in self.blobs.glob("*.vlt") if f.stem not in known]
+        return res
+
+    def upgrade_blobs(self, cb) -> int:
+        """Re-encrypt legacy files into fmt 2, chunk by chunk (no plaintext is written to disk)."""
+        todo = [e for e in self.entries if e.get("fmt") != 2]
+        for i, e in enumerate(todo):
+            blob = self.blobs / f"{e['id']}.vlt"; new = blob.with_suffix(".new")
+            self._write_blob(self._open_chunks(e), e, new, lambda n: None)
+            os.replace(new, blob); e["fmt"] = 2; self._save()
+            cb((i + 1) / len(todo))
+        return len(todo)
 
     def _ensure_folder(self, path: str) -> None:
         parts = path.split("/")
@@ -339,7 +415,7 @@ class Vault:
                 st = os.stat(p)
             except OSError:
                 self.skipped.append(p); continue
-            entry = {"id": uuid.uuid4().hex, "folder": vf, "name": os.path.basename(p), "size": st.st_size,
+            entry = {"id": uuid.uuid4().hex, "fmt": 2, "folder": vf, "name": os.path.basename(p), "size": st.st_size,
                      "mime": mimetypes.guess_type(p)[0] or "application/octet-stream", "mtime": st.st_mtime}
 
             def on_bytes(n: int) -> None:
@@ -348,7 +424,7 @@ class Vault:
                 cb(done / total)
 
             try:
-                self._encrypt_file(p, self.blobs / f"{entry['id']}.vlt", on_bytes)
+                self._write_blob(self._file_chunks(p), entry, self.blobs / f"{entry['id']}.vlt", on_bytes)
             except OSError:
                 (self.blobs / f"{entry['id']}.vlt").unlink(missing_ok=True)
                 self.skipped.append(p); continue
@@ -400,8 +476,9 @@ class Vault:
         """Re-encrypt an edited temp copy back into the vault."""
         blob = self.blobs / f"{entry['id']}.vlt"
         new = blob.with_suffix(".new")
-        self._encrypt_file(path, new, lambda n: None)
+        self._write_blob(self._file_chunks(path), entry, new, lambda n: None)
         os.replace(new, blob)
+        entry["fmt"] = 2
         st = os.stat(path)
         entry["size"], entry["mtime"] = st.st_size, st.st_mtime
         self._save()
@@ -474,6 +551,23 @@ class UserStore:
 
     def clear_avatar(self, u: dict) -> None:
         (self.dir(u["id"]) / "avatar.png").unlink(missing_ok=True); self.update(u, avatar="")
+
+    def restore(self, src: str, name: str) -> dict:
+        """Create a new user from a backup. Only vault files are accepted (blocks path-traversal entries)."""
+        ok = re.compile(r"^(vault\.meta|index\.vlt|blobs/[0-9a-f]{32}\.vlt)$")
+        try:
+            with zipfile.ZipFile(src) as z:
+                names = z.namelist()
+                if "vault.meta" not in names or not all(ok.match(n) for n in names):
+                    raise ValueError("That isn't a valid Daedalus backup.")
+                u = self.add(name)
+                try:
+                    z.extractall(self.dir(u["id"]))
+                except Exception:
+                    self.remove(u); raise
+        except zipfile.BadZipFile as e:
+            raise ValueError("That isn't a valid Daedalus backup.") from e
+        return u
 
     def wipe_all_tmp(self) -> None:
         for u in self.users: shutil.rmtree(self.dir(u["id"]) / "open", ignore_errors=True)
@@ -977,7 +1071,7 @@ class UserCard(TactileCard):
 
 
 class UserPicker(QWidget):
-    chosen, addRequested = Signal(dict), Signal()
+    chosen, addRequested, restoreRequested = Signal(dict), Signal(), Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -989,6 +1083,8 @@ class UserPicker(QWidget):
         sc = QScrollArea(); sc.setWidgetResizable(True); sc.setFrameShape(QFrame.NoFrame)
         holder = QWidget(); self.grid = QGridLayout(holder); self.grid.setSpacing(22); self.grid.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
         sc.setWidget(holder); lay.addWidget(sc, 1)
+        rb = QPushButton("Restore from backup…"); rb.setCursor(Qt.PointingHandCursor); rb.clicked.connect(self.restoreRequested)
+        lay.addWidget(rb, 0, Qt.AlignCenter)
 
     def refresh(self, store: UserStore) -> None:
         while self.grid.count():
@@ -1070,25 +1166,29 @@ class MainWindow(QMainWindow):
         self.view.deleteRequested.connect(self.delete_file)
         self.picker = UserPicker()
         self.picker.chosen.connect(self.select_user); self.picker.addRequested.connect(self.add_user)
+        self.picker.restoreRequested.connect(self.restore_backup)
+        self._idle = QTimer(self); self._idle.setSingleShot(True); self._idle.timeout.connect(self._auto_lock)
+        QApplication.instance().installEventFilter(self)       # any mouse / key activity resets the idle timer
         self.stack.addWidget(self.locked_page); self.stack.addWidget(self.view); self.stack.addWidget(self.picker)
         self._show_picker()
 
     def open_vault(self) -> None:
         fresh = not self.vault.exists()
         submit = (lambda pw: self.vault.create(pw, f"{self.user['name']}'s Vault")) if fresh else \
-                 (lambda pw: None if self.vault.unlock(pw) else "Incorrect password.")
+                 self._unlock_attempt
         if PasswordDialog(self, fresh, submit).exec() == QDialog.Accepted:
-            self._refresh(); self.stack.setCurrentIndex(1)
+            self._refresh(); self.stack.setCurrentIndex(1); self._arm_autolock()
 
-    def lock(self) -> None:
-        if self._job and self._job.isRunning(): return
+    def lock(self, quiet: bool = False) -> bool:
+        if self._job and self._job.isRunning(): return False
         stuck = self._flush_open()
         if stuck:
-            QMessageBox.warning(self, "Files still open", "Close these files in their apps first, then lock again:\n\n• " + "\n• ".join(stuck))
-            return
-        self.vault.lock(); self.view.refresh([], [])
+            if not quiet: QMessageBox.warning(self, "Files still open", "Close these files in their apps first, then lock again:\n\n• " + "\n• ".join(stuck))
+            return False
+        self._idle.stop(); self.vault.lock(); self.view.refresh([], [])
         self.locked_card.fresh = not self.vault.exists(); self.locked_card.update()
         self.stack.setCurrentIndex(0)
+        return True
 
     def add_files(self, paths: list[str]) -> None:
         zone = self.view.zone
@@ -1132,6 +1232,83 @@ class MainWindow(QMainWindow):
         dlg.accept(); self.vault.wipe_tmp(); self.opened.clear(); self.vault.lock()
         self.store.remove(self.user); self.vault = self.user = None
         self.view.refresh([], []); self._show_picker()
+
+    # ---- auto-lock ------------------------------------------------------
+    def _unlock_attempt(self, pw: str):
+        try:
+            return None if self.vault.unlock(pw) else "Incorrect password."
+        except ValueError as e:                              # e.g. damaged index
+            return str(e)
+
+    def _arm_autolock(self) -> None:
+        mins = (self.user or {}).get("autolock", 5)
+        if mins and self.vault and self.vault.key:
+            self._idle.start(mins * 60_000)
+        else:
+            self._idle.stop()
+
+    def _auto_lock(self) -> None:
+        if not (self.vault and self.vault.key): return
+        if QApplication.activeModalWidget() or not self.lock(quiet=True):
+            self._idle.start(60_000)        # busy (dialog, import, or a file still open elsewhere): retry in a minute
+
+    def eventFilter(self, obj, ev) -> bool:
+        if ev.type() in (QEvent.MouseMove, QEvent.MouseButtonPress, QEvent.KeyPress, QEvent.Wheel):
+            self._arm_autolock()
+        return super().eventFilter(obj, ev)
+
+    def changeEvent(self, e) -> None:
+        super().changeEvent(e)
+        if (e.type() == QEvent.WindowStateChange and self.isMinimized() and self.vault and self.vault.key
+                and self.user.get("lock_on_minimize", True) and self.stack.currentIndex() == 1):
+            QTimer.singleShot(0, lambda: self.lock(quiet=True))
+
+    # ---- backup / restore -----------------------------------------------
+    def export_backup(self) -> None:
+        name = f"{self.user['name']}_{time.strftime('%Y%m%d')}.dvbak"
+        dest, _ = QFileDialog.getSaveFileName(self, "Save encrypted backup", name, "Daedalus backup (*.dvbak)")
+        if not dest: return
+        self.view.count.setText("Writing backup…")
+        self._job = Job(lambda cb: self.vault.backup(dest, cb))
+        self._job.ok.connect(lambda q: (self._refresh(), QMessageBox.information(self, "Backup saved",
+                             f"Encrypted backup saved to:\n{q}\n\nIt stays encrypted: you still need your password to open it.")))
+        self._job.fail.connect(lambda m: (self._refresh(), QMessageBox.warning(self, "Vault", m)))
+        self._job.start()
+
+    def verify_vault(self) -> None:
+        self.view.count.setText("Verifying files…")
+        self._job = Job(lambda cb: self.vault.verify(cb))
+        self._job.ok.connect(self._show_verify)
+        self._job.fail.connect(lambda m: (self._refresh(), QMessageBox.warning(self, "Vault", m)))
+        self._job.start()
+
+    def _show_verify(self, r: dict) -> None:
+        self._refresh()
+        bad = r["damaged"] + r["missing"]
+        lines = [f"Checked {r['checked']} file{'s' if r['checked'] != 1 else ''}."]
+        if not bad: lines.append("Everything is intact.")
+        if r["damaged"]: lines.append("Damaged: " + ", ".join(r["damaged"][:10]))
+        if r["missing"]: lines.append("Missing: " + ", ".join(r["missing"][:10]))
+        if r["orphans"]: lines.append(f"{len(r['orphans'])} unreferenced encrypted file(s), left over from interrupted imports.")
+        (QMessageBox.warning if bad else QMessageBox.information)(self, "Vault check", "\n".join(lines))
+
+    def upgrade_files(self) -> None:
+        self.view.count.setText("Upgrading files…")
+        self._job = Job(lambda cb: self.vault.upgrade_blobs(cb))
+        self._job.ok.connect(lambda n: (self._refresh(), QMessageBox.information(self, "Upgrade", f"{n} file(s) upgraded.")))
+        self._job.fail.connect(lambda m: (self._refresh(), QMessageBox.warning(self, "Vault", m)))
+        self._job.start()
+
+    def restore_backup(self) -> None:
+        f, _ = QFileDialog.getOpenFileName(self, "Choose a backup", "", "Daedalus backup (*.dvbak)")
+        if not f: return
+        name, ok = QInputDialog.getText(self, "Restore backup", "Name for the restored user:", text=Path(f).stem.split("_")[0])
+        if not ok or not name.strip(): return
+        try:
+            u = self.store.restore(f, name.strip())
+        except ValueError as e:
+            QMessageBox.warning(self, "Restore", str(e)); return
+        self.select_user(u)                                  # unlock it with the original password
 
     def _after_add(self) -> None:
         self._refresh()
@@ -1220,6 +1397,22 @@ class MainWindow(QMainWindow):
         if has:
             r = QPushButton("Remove backup password"); lay.addWidget(r)
             r.clicked.connect(lambda: (self.vault.remove_backup(), d.accept()))
+        lay.addSpacing(8); lay.addWidget(note("Security"))
+        mins = [0, 1, 5, 15, 30]
+        ac = QComboBox(); ac.addItems(["Auto-lock: never"] + [f"Auto-lock after {m} min idle" for m in mins[1:]])
+        cur = self.user.get("autolock", 5); ac.setCurrentIndex(mins.index(cur) if cur in mins else 2)
+        ac.currentIndexChanged.connect(lambda i: (self.store.update(self.user, autolock=mins[i]), self._arm_autolock()))
+        lay.addWidget(ac)
+        lm = QCheckBox("Lock when the window is minimized"); lm.setChecked(self.user.get("lock_on_minimize", True))
+        lm.toggled.connect(lambda v: self.store.update(self.user, lock_on_minimize=v)); lay.addWidget(lm)
+        bk = QPushButton("Export encrypted backup…"); lay.addWidget(bk)
+        bk.clicked.connect(lambda: (d.accept(), self.export_backup()))
+        vf = QPushButton("Verify vault integrity"); lay.addWidget(vf)
+        vf.clicked.connect(lambda: (d.accept(), self.verify_vault()))
+        legacy = sum(e.get("fmt") != 2 for e in self.vault.entries)
+        if legacy:
+            up2 = QPushButton(f"Upgrade {legacy} older file{'s' if legacy != 1 else ''} to the newer format…"); lay.addWidget(up2)
+            up2.clicked.connect(lambda: (d.accept(), self.upgrade_files()))
         lay.addSpacing(10)
         dz = QPushButton("Delete this user and their vault…"); dz.setStyleSheet(f"color:{ERROR};"); lay.addWidget(dz)
         dz.clicked.connect(lambda: self._delete_user(d))
